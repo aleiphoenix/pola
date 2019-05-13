@@ -938,9 +938,22 @@ void touch_pid_file(const char * filename) {
 }
 
 void remove_pid_file(const char * filename) {
-	int status = remove(filename);
+	if (access(filename, F_OK) == -1) {
+		// fprintf(stderr, "pidfile %s not exists.\n", filename);
+		return;
+	}
+
+	if (access(filename, W_OK) == -1) {
+		fprintf(stderr, "no permisson on %s\n", filename);
+		return;
+	}
+
+	int status = unlink(filename);
 	if (status != 0) {
 		// perror("cannot remove pid file");
+		fprintf(stderr, "status: %d\n", status);
+		fprintf(stderr, "filename: %s\n", filename);
+		fprintf(stderr, "%s\n", strerror(errno));
 		fprintf(stderr, "cannot remove pid file");
 	}
 }
@@ -1388,8 +1401,9 @@ void info(const app_t app)
 	get_pid_filename(app, pid_fname);
 
 	// get config file path
-	char * apps_path = (char *)malloc((strlen(POLA_APPS) + 1) * sizeof(char));
-	strncpy(apps_path, POLA_APPS, strlen(POLA_APPS));
+	char * apps_path = (char *)malloc(
+		(strlen(POLA_APPS) + 1) * sizeof(char));
+	strncpy(apps_path, POLA_APPS, strlen(POLA_APPS) + 1);
 	char * config_filename = (char *)malloc((1024 + 1) * sizeof(char));
 	char * config_dir = dirname(apps_path);
 	path_join(config_dir, (char *)app.name, config_filename);
