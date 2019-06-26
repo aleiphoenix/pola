@@ -1,9 +1,14 @@
 #define _POSIX_C_SOURCE 199309L
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <asm/errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <glob.h>
+#include <grp.h>
 #include <libgen.h>
 #include <locale.h>
 #include <netdb.h>
@@ -75,6 +80,29 @@ int send_udp_msg(const char *, const int, const char *);
 pid_t read_pidfile(const char *);
 void get_pid_filename(app_t, char *);
 void remove_pid_file(const char *);
+
+// https://github.com/cloudius-systems/musl/blob/master/src/misc/getgrouplist.c
+int mygetgrouplist(const char *user, gid_t gid, gid_t *groups, int *ngroups)
+{
+	size_t n, i;
+	struct group *gr;
+	if (*ngroups<1) return -1;
+	n = *ngroups;
+	*groups++ = gid;
+	*ngroups = 1;
+
+	setgrent();
+	while ((gr = getgrent()) && *ngroups < 0x7fffffff) {
+		for (i=0; gr->gr_mem[i] && strcmp(user, gr->gr_mem[i]); i++);
+		if (!gr->gr_mem[i]) continue;
+
+		if (++*ngroups <= n) *groups++ = gr->gr_gid;
+	}
+	endgrent();
+
+	return *ngroups > n ? -1 : *ngroups;
+}
+
 
 void * metric_thread(void * args)
 {
@@ -272,11 +300,43 @@ void switch_user(const char * user, char ** env)
 		exit(1);
 	}
 
+	// should fix before setuid
+	printf("[%s] apply setgroups_fix\n", sys_argv[0]);
+
+	// use first
+	int ngroups = 1;
+	gid_t * groups = calloc(ngroups, sizeof(gid_t *));
+
+	printf("[%s] >>> get group list\n", sys_argv[0]);
+	// first run, use 1 size, intentionally fetch real ngroups size
+	// why not vanilla getgrouplist ?
+	// musl static build will not work with glibc system
+	// invalid seek -> ESPIPE error
+	if (mygetgrouplist(p->pw_name, p->pw_gid, groups, &ngroups) == -1) {
+		printf("[%s] >>> ngroups: %d\n", sys_argv[0], ngroups);
+
+		free(groups);
+		groups = calloc(ngroups, sizeof(gid_t *));
+		printf("[%s] >>> got %d groups\n", sys_argv[0], ngroups);
+		if (mygetgrouplist(p->pw_name, p->pw_gid, groups, &ngroups) == -1) {
+			printf("ngroups: %d\n", ngroups);
+			perror("getgrouplist error");
+			exit(1);
+		}
+	}
+
+	printf("[%s] >>> set group list\n", sys_argv[0]);
+	if (setgroups(ngroups, groups) == -1) {
+		perror("setgroups() failed");
+		exit(1);
+	}
+
 	if (setgid(p->pw_gid) == -1) {
 		fprintf(stderr, "cannot setgid -> %d\n", p->pw_gid);
 		exit(1);
 	}
 	printf("[%s] setgid to %d\n", sys_argv[0], p->pw_gid);
+
 
 	if (setuid(p->pw_uid) == -1) {
 		fprintf(stderr, "cannot setuid -> %d\n", p->pw_uid);
@@ -694,7 +754,7 @@ void read_config(const char * path)
 	memset(value, '\0', 8192 + 1);
 
 	/* default interval */
-	config.interval = 100;
+	config.interval = IOLOOP_INTERVAL_DEFAULT;
 
 	while (fgets(buf, line_size, fh)) {
 		line = trim(buf);
