@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -29,6 +28,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
+#include <poll.h>
 
 #include <json-c/json.h>
 
@@ -70,8 +70,9 @@ static int sig_handling = 0;
 static int metric_running = 0;
 static pthread_t metric_p = 0;
 static unsigned int daemon_flag = 0;
+static process_t * children;
 
-void signal_handlers(int sig);
+void signal_handler(int sig);
 void read_output(const int fd);
 void children_io(int * fds, size_t count);
 void cleanup_metric_flag(void *);
@@ -417,11 +418,21 @@ void signal_handler(int sig) {
 			return;
 		}
 
-		pid_t pid = getpid();
-		/* stopsig */
-		kill(-pid, SIGTERM);
+		// pid_t pid = getpid();
+		/* TODO: stopsig */
+		for (unsigned int i = 0; i < current_app.proc_num; i++) {
+			LOG_TRACE(
+				LOG_INFO, ">>> children %d pid: %d\n", i,
+				children[i].pid);
+			kill(children[i].pid, SIGTERM);
+		}
+
 		int status = 0;
-		waitpid(0, &status, 0);
+		pid_t child_pid;
+		child_pid = waitpid(0, &status, 0);
+		LOG_TRACE(
+			LOG_INFO, "<<< child pid: %d, waitpid pid status: %d\n",
+			child_pid, status);
 		sig_handling = 0;
 
 		remove_pid_file(pid_fname);
@@ -519,7 +530,9 @@ void run_child(const char * command, const char * user, process_t * p)
 	close(fd[1]);
 
 	int flags = fcntl(fd[0], F_GETFL, 0);
-	fcntl(fd[0], F_SETFL, flags | O_NONBLOCK);
+	if (fcntl(fd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+		perror("fcntl error");
+	}
 
 	p->fd = fd[0];
 	p->pid = pid;
@@ -575,45 +588,31 @@ end:
 
 void children_io(int * fds, size_t count)
 {
+	if (count == 0) {
+		return;
+	}
 
-	/* detect, use epoll */
-	fd_set readfds;
-	FD_ZERO(&readfds);
-
-	int max_fd = 0;
-
+	struct pollfd * pfds = calloc(sizeof(struct pollfd), count);
 	for (size_t i = 0; i < count; i++) {
-		if (fds[i] > 0) {
-			FD_SET(fds[i], &readfds);
+		pfds[i].fd = fds[i];
+		pfds[i].events = POLLIN;
+	}
+
+	int n = poll(pfds, count, 1000);
+	switch (n) {
+	case 0:
+		; // timeout, no fds ready
+	case POLL_ERR:
+		if (errno == EAGAIN) {
+			// timeout on non-blocking fd
+		} else {
+			perror("children_io poll error");
 		}
-
-		if (fds[i] > max_fd) max_fd = fds[i];
-	}
-
-	if (max_fd == 0) return;
-
-	struct timeval timeout = {0, 100};
-
-	int rc = select(
-		max_fd + 1,
-		&readfds,
-		NULL,
-		NULL,
-		&timeout);
-
-	if (rc == 0) {
-		/* timeout */
-		return;
-	}
-
-	if (rc == -1) {
-		perror("children_io");
-		return;
-	}
-
-	for (size_t i = 0; i < count; i++) {
-		if (FD_ISSET(fds[i], &readfds)) {
-			read_output(fds[i]);
+	default:
+		for (unsigned int i = 0; i < count; i++) {
+			if (pfds[i].revents & POLLIN) {
+				read_output(fds[i]);
+			}
 		}
 	}
 }
@@ -659,7 +658,7 @@ void master_loop(const app_t app)
 {
 
 	int fds[app.proc_num];
-	process_t children[app.proc_num];
+	children = calloc(app.proc_num, sizeof(process_t *));
 
 	/* init fds and children*/
 	for (unsigned int i = 0; i < app.proc_num; i++) {
@@ -670,7 +669,7 @@ void master_loop(const app_t app)
 
 	while (1) {
 		spawn_missing_children(app, children, fds);
-		children_io(fds, app.proc_num);
+		children_io(fds, app.proc_num); // FIXME: refactor to reuse?
 		reap_children(app, children, fds);
 	}
 }
